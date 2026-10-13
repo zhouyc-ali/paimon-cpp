@@ -112,4 +112,29 @@ void vx_callback_sink_close(vx_callback_sink* sink, vx_error** error_out);
 
 /// Discard the sink without writing a footer, leaving whatever the host received invalid.
 void vx_callback_sink_abort(vx_callback_sink* sink);
+
+/// Time unit of a timestamp scalar literal. Mirrors `vx_time_unit` in
+/// crates/vortex_callback_io/callback_io.rs; the discriminants are an ABI contract, so do not
+/// reorder or renumber them.
+typedef enum {
+    /// Seconds since the Unix epoch.
+    VX_TIME_UNIT_SECOND = 0,
+    /// Milliseconds since the Unix epoch.
+    VX_TIME_UNIT_MILLISECOND = 1,
+    /// Microseconds since the Unix epoch.
+    VX_TIME_UNIT_MICROSECOND = 2,
+    /// Nanoseconds since the Unix epoch.
+    VX_TIME_UNIT_NANOSECOND = 3,
+} vx_time_unit;
+
+/// Create a timestamp scalar literal: `value` units since the Unix epoch under `unit`. `timezone`
+/// is a null-terminated UTF-8 IANA zone name, or null for a local (wall-clock) timestamp. Vortex's
+/// own C ABI has no temporal scalar constructor, so paimon-cpp adds these two to push down temporal
+/// predicates. Returns null and sets `err` on failure; free the result with `vx_scalar_free`.
+vx_scalar* vx_scalar_new_timestamp(int64_t value, vx_time_unit unit, const char* timezone,
+                                   bool is_nullable, vx_error** err);
+
+/// Create a date scalar literal: `days` days since the Unix epoch (1970-01-01). Returns null and
+/// sets `err` on failure; free the result with `vx_scalar_free`.
+vx_scalar* vx_scalar_new_date(int32_t days, bool is_nullable, vx_error** err);
 }

@@ -58,6 +58,7 @@
 #include "paimon/testing/utils/io_exception_helper.h"
 #include "paimon/testing/utils/read_result_collector.h"
 #include "paimon/testing/utils/testharness.h"
+#include "paimon/utils/roaring_bitmap32.h"
 
 namespace paimon::vortex::test {
 
@@ -810,6 +811,64 @@ TEST_F(VortexFileFormatTest, WriteSurfacesInjectedIOError) {
         break;
     }
     ASSERT_TRUE(run_complete);
+}
+
+// Row selection is pushed into the Vortex scan (include-by-index): the reader returns only the
+// selected rows and reports their original physical row ids (mirrors Java's fromArray mapping).
+TEST_F(VortexFileFormatTest, SelectionPushdownReturnsSelectedRowsAndPhysicalRowIds) {
+    const int64_t kRows = 10;
+    arrow::Int32Builder id_b;
+    arrow::StringBuilder name_b;
+    for (int64_t i = 0; i < kRows; ++i) {
+        ASSERT_TRUE(id_b.Append(static_cast<int32_t>(i * 10)).ok());
+        ASSERT_TRUE(name_b.Append("row_" + std::to_string(i)).ok());
+    }
+    std::shared_ptr<arrow::Array> id_arr;
+    std::shared_ptr<arrow::Array> name_arr;
+    ASSERT_TRUE(id_b.Finish(&id_arr).ok());
+    ASSERT_TRUE(name_b.Finish(&name_arr).ok());
+    arrow::FieldVector fields = {arrow::field("id", arrow::int32(), false),
+                                 arrow::field("name", arrow::utf8())};
+    std::shared_ptr<arrow::Schema> schema = arrow::schema(fields);
+    std::shared_ptr<arrow::Array> data =
+        arrow::StructArray::Make({id_arr, name_arr}, fields).ValueOrDie();
+
+    std::string path = PathUtil::JoinPath(directory_->Str(), "selection.vortex");
+    ASSERT_OK(WriteFile(path, schema, data, /*batch_size=*/4));
+
+    // Select physical rows {1, 3, 5, 7}; their id values are {10, 30, 50, 70}.
+    RoaringBitmap32 selection = RoaringBitmap32::From({1, 3, 5, 7});
+
+    // batch_size=2 spreads the 4 selected rows over two batches, exercising the cross-batch row id.
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<ReaderBuilder> reader_builder,
+                         format_->CreateReaderBuilder(/*batch_size=*/2));
+    reader_builder->WithMemoryPool(pool_);
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<InputStream> input, file_system_->Open(path));
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<FileBatchReader> reader, reader_builder->Build(input));
+    ::ArrowSchema ffi_schema = {};
+    ASSERT_TRUE(arrow::ExportSchema(*schema, &ffi_schema).ok());
+    ASSERT_OK(reader->SetReadSchema(&ffi_schema, /*predicate=*/nullptr, selection));
+
+    std::vector<int32_t> got_ids;
+    std::vector<uint64_t> got_row_ids;
+    while (true) {
+        ASSERT_OK_AND_ASSIGN(BatchReader::ReadBatch batch, reader->NextBatch());
+        if (BatchReader::IsEofBatch(batch)) {
+            break;
+        }
+        std::shared_ptr<arrow::Array> arr =
+            arrow::ImportArray(batch.first.get(), batch.second.get()).ValueOrDie();
+        std::shared_ptr<arrow::Int32Array> id_col = std::static_pointer_cast<arrow::Int32Array>(
+            std::static_pointer_cast<arrow::StructArray>(arr)->GetFieldByName("id"));
+        for (int64_t i = 0; i < arr->length(); ++i) {
+            got_ids.push_back(id_col->Value(i));
+            ASSERT_OK_AND_ASSIGN(uint64_t row_id,
+                                 reader->GetPreviousBatchFileRowId(static_cast<uint64_t>(i)));
+            got_row_ids.push_back(row_id);
+        }
+    }
+    ASSERT_EQ(got_ids, (std::vector<int32_t>{10, 30, 50, 70}));
+    ASSERT_EQ(got_row_ids, (std::vector<uint64_t>{1, 3, 5, 7}));
 }
 
 }  // namespace paimon::vortex::test

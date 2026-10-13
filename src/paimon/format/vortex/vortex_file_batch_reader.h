@@ -22,6 +22,7 @@
 #include <cstdint>
 #include <limits>
 #include <memory>
+#include <vector>
 
 #include "arrow/type_fwd.h"
 #include "paimon/format/vortex/vortex_ffi.h"
@@ -63,15 +64,14 @@ class VortexFileBatchReader : public FileBatchReader {
     std::shared_ptr<Metrics> GetReaderMetrics() const override;
     void Close() override;
     bool SupportPreciseBitmapSelection() const override {
-        return false;
+        return true;
     }
 
  private:
     VortexFileBatchReader(const std::shared_ptr<InputStream>& input, int32_t batch_size,
                           std::shared_ptr<VortexInputContext> input_context, VxSessionPtr session,
                           VxDataSourcePtr data_source, VxScanPtr scan,
-                          const std::shared_ptr<arrow::Schema>& file_schema,
-                          const std::shared_ptr<arrow::DataType>& struct_type, uint64_t total_rows,
+                          const std::shared_ptr<arrow::Schema>& file_schema, uint64_t total_rows,
                           const std::shared_ptr<arrow::MemoryPool>& arrow_pool);
 
     /// Pull the next Arrow array from the current partition stream, opening the next partition's
@@ -96,20 +96,18 @@ class VortexFileBatchReader : public FileBatchReader {
     VxSessionPtr session_;
     VxDataSourcePtr data_source_;
     VxScanPtr scan_;
-    // The file schema with Vortex's string/binary view types normalized to the standard types; this
+    // The full file schema as exported by Vortex (view types already normalized to standard); this
     // is what GetFileSchema() reports to paimon.
     std::shared_ptr<arrow::Schema> file_schema_;
-    // The RAW view-typed struct that Vortex's Arrow export produces. NextBatch imports each scanned
-    // batch as this type (so it must match the C export's buffer layout), then NormalizeViewArray
-    // rewrites it to file_schema_'s types. Keeping this view-typed is load-bearing: normalizing it
-    // would make ImportArray misread the buffers.
-    std::shared_ptr<arrow::DataType> struct_type_;
     // The schema NextBatch must output, set by SetReadSchema (the projected read schema). Null
     // until SetReadSchema is called, in which case the full file schema is returned.
     std::shared_ptr<arrow::Schema> read_schema_;
     uint64_t total_rows_ = 0;
 
     ::ArrowArrayStream current_stream_{};
+    // The scan's actual output schema for current_stream_ (projected columns, standard types);
+    // ReadNextArray imports each batch as this struct type.
+    std::shared_ptr<arrow::Schema> current_stream_schema_;
     bool stream_active_ = false;
     std::shared_ptr<arrow::Array> current_batch_;
     int64_t current_batch_offset_ = 0;
@@ -117,6 +115,13 @@ class VortexFileBatchReader : public FileBatchReader {
     uint64_t rows_emitted_ = 0;
     uint64_t previous_first_row_ = std::numeric_limits<uint64_t>::max();
     uint64_t previous_batch_row_count_ = 0;
+
+    // Row selection pushed into the scan as include-by-index. selection_row_ids_ holds the selected
+    // original row ids in ascending order; GetPreviousBatchFileRowId maps an emitted row back to
+    // its physical position through it (Vortex returns selected rows in ascending order under
+    // ordered).
+    bool has_selection_ = false;
+    std::vector<uint64_t> selection_row_ids_;
 
     std::shared_ptr<arrow::MemoryPool> arrow_pool_;
     std::shared_ptr<PredicateFilter> predicate_filter_;  // from SetReadSchema; not pushed down

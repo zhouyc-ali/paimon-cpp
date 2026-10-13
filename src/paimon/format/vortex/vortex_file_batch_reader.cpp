@@ -23,6 +23,7 @@
 #include <limits>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include "arrow/api.h"
 #include "arrow/c/bridge.h"
@@ -38,135 +39,11 @@
 #include "paimon/core/utils/nested_projection_utils.h"
 #include "paimon/format/vortex/vortex_ffi_util.h"
 #include "paimon/fs/file_system.h"
+#include "paimon/utils/roaring_bitmap32.h"
 
 namespace paimon::vortex {
 
 namespace {
-
-// Vortex's Arrow export represents strings and binaries with the view types (StringView /
-// BinaryView). paimon schemas use the standard string/binary types, so map the view types back,
-// recursing through nested types. Types that contain no views are returned unchanged.
-std::shared_ptr<arrow::DataType> NormalizeViewType(const std::shared_ptr<arrow::DataType>& type) {
-    switch (type->id()) {
-        case arrow::Type::STRING_VIEW:
-            return arrow::utf8();
-        case arrow::Type::BINARY_VIEW:
-            return arrow::binary();
-        case arrow::Type::STRUCT: {
-            arrow::FieldVector fields;
-            fields.reserve(type->num_fields());
-            for (const std::shared_ptr<arrow::Field>& field : type->fields()) {
-                fields.push_back(field->WithType(NormalizeViewType(field->type())));
-            }
-            return arrow::struct_(fields);
-        }
-        case arrow::Type::LIST:
-            return arrow::list(type->field(0)->WithType(NormalizeViewType(type->field(0)->type())));
-        case arrow::Type::FIXED_SIZE_LIST:
-            return arrow::fixed_size_list(
-                type->field(0)->WithType(NormalizeViewType(type->field(0)->type())),
-                checked_cast<const arrow::FixedSizeListType&>(*type).list_size());
-        default:
-            return type;
-    }
-}
-
-std::shared_ptr<arrow::Schema> NormalizeViewSchema(const std::shared_ptr<arrow::Schema>& schema) {
-    arrow::FieldVector fields;
-    fields.reserve(schema->num_fields());
-    for (const std::shared_ptr<arrow::Field>& field : schema->fields()) {
-        fields.push_back(field->WithType(NormalizeViewType(field->type())));
-    }
-    return arrow::schema(fields, schema->metadata());
-}
-
-// Rebuilds `array` with every StringView/BinaryView column (which Vortex's Arrow export produces)
-// converted to the standard string/binary type. Arrow 17 has no cast kernel between the view and
-// standard types, so the leaves are rebuilt with builders and the parents reconstructed, recursing
-// through structs and lists. Arrays with no view-typed data are returned unchanged. `array` must be
-// offset-normalized (offset 0) so the rebuilt parents and children stay consistent.
-Result<std::shared_ptr<arrow::Array>> NormalizeViewArray(const std::shared_ptr<arrow::Array>& array,
-                                                         arrow::MemoryPool* pool) {
-    // TODO(zhouyc-ali): avoid the per-row copy by exporting standard utf8/binary
-    switch (array->type_id()) {
-        case arrow::Type::STRING_VIEW: {
-            const auto& view = checked_cast<const arrow::StringViewArray&>(*array);
-            arrow::StringBuilder builder(pool);
-            for (int64_t i = 0; i < view.length(); ++i) {
-                if (view.IsNull(i)) {
-                    PAIMON_RETURN_NOT_OK_FROM_ARROW(builder.AppendNull());
-                } else {
-                    PAIMON_RETURN_NOT_OK_FROM_ARROW(builder.Append(view.GetView(i)));
-                }
-            }
-            std::shared_ptr<arrow::Array> out;
-            PAIMON_RETURN_NOT_OK_FROM_ARROW(builder.Finish(&out));
-            return out;
-        }
-        case arrow::Type::BINARY_VIEW: {
-            const auto& view = checked_cast<const arrow::BinaryViewArray&>(*array);
-            arrow::BinaryBuilder builder(pool);
-            for (int64_t i = 0; i < view.length(); ++i) {
-                if (view.IsNull(i)) {
-                    PAIMON_RETURN_NOT_OK_FROM_ARROW(builder.AppendNull());
-                } else {
-                    PAIMON_RETURN_NOT_OK_FROM_ARROW(builder.Append(view.GetView(i)));
-                }
-            }
-            std::shared_ptr<arrow::Array> out;
-            PAIMON_RETURN_NOT_OK_FROM_ARROW(builder.Finish(&out));
-            return out;
-        }
-        case arrow::Type::STRUCT: {
-            const auto& struct_array = checked_cast<const arrow::StructArray&>(*array);
-            arrow::ArrayVector children;
-            arrow::FieldVector fields;
-            children.reserve(struct_array.num_fields());
-            fields.reserve(struct_array.num_fields());
-            bool changed = false;
-            for (int32_t i = 0; i < struct_array.num_fields(); ++i) {
-                const std::shared_ptr<arrow::Array>& child = struct_array.field(i);
-                PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<arrow::Array> normalized_child,
-                                       NormalizeViewArray(child, pool));
-                changed = changed || normalized_child.get() != child.get();
-                fields.push_back(array->type()->field(i)->WithType(normalized_child->type()));
-                children.push_back(std::move(normalized_child));
-            }
-            if (!changed) {
-                return array;
-            }
-            return std::make_shared<arrow::StructArray>(
-                arrow::struct_(fields), struct_array.length(), children, struct_array.null_bitmap(),
-                struct_array.null_count(), struct_array.offset());
-        }
-        case arrow::Type::LIST: {
-            const auto& list = checked_cast<const arrow::ListArray&>(*array);
-            PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<arrow::Array> values,
-                                   NormalizeViewArray(list.values(), pool));
-            if (values.get() == list.values().get()) {
-                return array;
-            }
-            return std::make_shared<arrow::ListArray>(
-                arrow::list(array->type()->field(0)->WithType(values->type())), list.length(),
-                list.value_offsets(), values, list.null_bitmap(), list.null_count(), list.offset());
-        }
-        case arrow::Type::FIXED_SIZE_LIST: {
-            const auto& list = checked_cast<const arrow::FixedSizeListArray&>(*array);
-            PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<arrow::Array> values,
-                                   NormalizeViewArray(list.values(), pool));
-            if (values.get() == list.values().get()) {
-                return array;
-            }
-            const auto& fsl_type = checked_cast<const arrow::FixedSizeListType&>(*array->type());
-            return std::make_shared<arrow::FixedSizeListArray>(
-                arrow::fixed_size_list(array->type()->field(0)->WithType(values->type()),
-                                       fsl_type.list_size()),
-                list.length(), values, list.null_bitmap(), list.null_count(), list.offset());
-        }
-        default:
-            return array;
-    }
-}
 
 // Vortex reports the file's zone and paimon asks for the reader's; the instants are the same.
 std::shared_ptr<arrow::ArrayData> AlignTimestampTimezones(
@@ -236,16 +113,14 @@ VortexFileBatchReader::VortexFileBatchReader(
     const std::shared_ptr<InputStream>& input, int32_t batch_size,
     std::shared_ptr<VortexInputContext> input_context, VxSessionPtr session,
     VxDataSourcePtr data_source, VxScanPtr scan, const std::shared_ptr<arrow::Schema>& file_schema,
-    const std::shared_ptr<arrow::DataType>& struct_type, uint64_t total_rows,
-    const std::shared_ptr<arrow::MemoryPool>& arrow_pool)
+    uint64_t total_rows, const std::shared_ptr<arrow::MemoryPool>& arrow_pool)
     : input_(input),
       batch_size_(batch_size),
       input_context_(std::move(input_context)),
       session_(std::move(session)),
       data_source_(std::move(data_source)),
       scan_(std::move(scan)),
-      file_schema_(NormalizeViewSchema(file_schema)),
-      struct_type_(struct_type),
+      file_schema_(file_schema),
       total_rows_(total_rows),
       arrow_pool_(arrow_pool),
       metrics_(std::make_shared<MetricsImpl>()) {}
@@ -291,9 +166,6 @@ Result<std::unique_ptr<VortexFileBatchReader>> VortexFileBatchReader::Create(
     }
     PAIMON_ASSIGN_OR_RAISE_FROM_ARROW(std::shared_ptr<arrow::Schema> file_schema,
                                       arrow::ImportSchema(&ffi_schema));
-    // Built from the raw view-typed schema on purpose: NextBatch imports each scanned batch as this
-    // exact type, while the constructor normalizes its own copy kept as file_schema_.
-    std::shared_ptr<arrow::DataType> struct_type = arrow::struct_(file_schema->fields());
 
     vx_estimate row_count{};
     vx_data_source_get_row_count(data_source.get(), &row_count);
@@ -306,7 +178,7 @@ Result<std::unique_ptr<VortexFileBatchReader>> VortexFileBatchReader::Create(
     // scan may be consumed only once.
     return std::unique_ptr<VortexFileBatchReader>(new VortexFileBatchReader(
         input, batch_size, std::move(input_context), std::move(session), std::move(data_source),
-        VxScanPtr(nullptr, vx_scan_free), file_schema, struct_type, total_rows, arrow_pool));
+        VxScanPtr(nullptr, vx_scan_free), file_schema, total_rows, arrow_pool));
 }
 
 VortexFileBatchReader::~VortexFileBatchReader() {
@@ -314,12 +186,49 @@ VortexFileBatchReader::~VortexFileBatchReader() {
 }
 
 Result<bool> VortexFileBatchReader::OpenNextPartitionStream() {
+    if (has_selection_ && selection_row_ids_.empty()) {
+        return false;  // Empty selection selects no rows.
+    }
     if (scan_ == nullptr) {
         vx_error* error = nullptr;
         // Scan in storage order: Vortex defaults to ordered=false and may emit chunks out of order,
         // which would misalign the physical row positions NextBatch assigns.
-        vx_scan_options options{};  // zero-init: all columns, no filter/row-range/selection/limit
+        vx_scan_options options{};  // zero-init: no filter/row-range/selection/limit
         options.ordered = true;
+        // Select only the read_schema_ columns present in the file; a requested column absent from
+        // the file is null-filled by AlignToReadSchema, so it must not be selected here. The scan
+        // clones the projection, so the expressions are freed when this block exits.
+        VxExpressionPtr root(nullptr, vx_expression_free);
+        VxExpressionPtr projection(nullptr, vx_expression_free);
+        std::vector<std::string> names;
+        std::vector<const char*> name_ptrs;
+        if (read_schema_ != nullptr) {
+            names.reserve(read_schema_->num_fields());
+            for (const std::shared_ptr<arrow::Field>& field : read_schema_->fields()) {
+                if (file_schema_->GetFieldIndex(field->name()) >= 0) {
+                    names.push_back(field->name());
+                }
+            }
+            if (!names.empty()) {
+                name_ptrs.reserve(names.size());
+                for (const std::string& name : names) {
+                    name_ptrs.push_back(name.c_str());
+                }
+                root = VxExpressionPtr(vx_expression_root(), vx_expression_free);
+                projection = VxExpressionPtr(
+                    vx_expression_select(name_ptrs.data(), name_ptrs.size(), root.get()),
+                    vx_expression_free);
+                options.projection = projection.get();
+            }
+        }
+        // Push the row selection as include-by-index. Despite its name, VX_SELECTION_INCLUDE_RANGE
+        // maps to Vortex's Selection::IncludeByIndex: idx is a list of individual row indices. The
+        // scan copies idx, so selection_row_ids_ need only outlive this call.
+        if (has_selection_) {
+            options.selection.idx = selection_row_ids_.data();
+            options.selection.idx_len = selection_row_ids_.size();
+            options.selection.include = VX_SELECTION_INCLUDE_RANGE;
+        }
         VxScanPtr scan(
             vx_data_source_scan(data_source_.get(), &options, /*estimate=*/nullptr, &error),
             vx_scan_free);
@@ -347,6 +256,18 @@ Result<bool> VortexFileBatchReader::OpenNextPartitionStream() {
     }
     current_stream_ = stream;
     stream_active_ = true;
+    // Import batches with the scan's actual output schema (projected columns, standard types).
+    ::ArrowSchema ffi_schema = {};
+    if (current_stream_.get_schema(&current_stream_, &ffi_schema) != 0) {
+        Status callback_status = input_context_->GetCallbackStatus();
+        ReleaseStream();
+        if (!callback_status.ok()) {
+            return callback_status.WithMessage("read Vortex stream schema", ": ",
+                                               callback_status.message());
+        }
+        return Status::IOError("Vortex Arrow stream get_schema failed");
+    }
+    PAIMON_ASSIGN_OR_RAISE_FROM_ARROW(current_stream_schema_, arrow::ImportSchema(&ffi_schema));
     return true;
 }
 
@@ -379,8 +300,9 @@ Result<std::shared_ptr<arrow::Array>> VortexFileBatchReader::ReadNextArray() {
             ReleaseStream();  // Partition exhausted; try the next one.
             continue;
         }
-        PAIMON_ASSIGN_OR_RAISE_FROM_ARROW(std::shared_ptr<arrow::Array> array,
-                                          arrow::ImportArray(&ffi_array, struct_type_));
+        PAIMON_ASSIGN_OR_RAISE_FROM_ARROW(
+            std::shared_ptr<arrow::Array> array,
+            arrow::ImportArray(&ffi_array, arrow::struct_(current_stream_schema_->fields())));
         if (array->length() == 0) {
             continue;  // Skip empty batches.
         }
@@ -393,7 +315,6 @@ Result<std::shared_ptr<arrow::Array>> VortexFileBatchReader::AlignToReadSchema(
     if (read_schema_ == nullptr) {
         return array;
     }
-    // TODO(zhouyc-ali): push top-level column pruning into the Vortex scan
     std::shared_ptr<arrow::DataType> read_type = arrow::struct_(read_schema_->fields());
     return NestedProjectionUtils::AlignArrayToReadType(
         arrow::MakeArray(AlignTimestampTimezones(array->data(), read_type)), read_type,
@@ -419,12 +340,8 @@ Result<BatchReader::ReadBatch> VortexFileBatchReader::NextBatch() {
         current_batch_->Slice(current_batch_offset_, row_count);
     PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<arrow::Array> normalized_array,
                            ArrowUtils::NormalizeArrayOffsets(sliced_array, arrow_pool_.get()));
-    // Vortex exports strings/binaries as Arrow view types; convert to the standard ones (no cast
-    // kernel in Arrow 17) after offset normalization, so the array is offset-0.
-    PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<arrow::Array> output_array,
-                           NormalizeViewArray(normalized_array, arrow_pool_.get()));
     PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<arrow::Array> projected_array,
-                           AlignToReadSchema(output_array));
+                           AlignToReadSchema(normalized_array));
 
     previous_first_row_ = rows_emitted_;
     previous_batch_row_count_ = static_cast<uint64_t>(row_count);
@@ -451,10 +368,23 @@ Status VortexFileBatchReader::SetReadSchema(
     if (read_schema == nullptr) {
         return Status::Invalid("Vortex read schema is nullptr");
     }
-    // TODO(zhouyc-ali): push the row selection into the Vortex scan
-    (void)selection_bitmap;
-    // No pushdown: the whole file is scanned and reading restarts from row 0, so drop the
-    // single-use scan; the next read re-creates it.
+    // Push the row selection into the scan as include-by-index, keeping the selected original row
+    // ids so GetPreviousBatchFileRowId can map emitted rows back to physical positions.
+    has_selection_ = selection_bitmap.has_value();
+    selection_row_ids_.clear();
+    if (selection_bitmap) {
+        selection_row_ids_.reserve(static_cast<size_t>(selection_bitmap->Cardinality()));
+        for (auto iter = selection_bitmap->Begin(); iter != selection_bitmap->End(); ++iter) {
+            const auto row_id = static_cast<uint64_t>(*iter);
+            if (row_id >= total_rows_) {
+                return Status::Invalid(
+                    fmt::format("Vortex selected row {} is out of range {}", row_id, total_rows_));
+            }
+            selection_row_ids_.push_back(row_id);
+        }
+    }
+    // The scan options (projection/selection) may change, so drop the single-use scan; the next
+    // read re-creates it.
     PAIMON_ASSIGN_OR_RAISE_FROM_ARROW(std::shared_ptr<arrow::Schema> imported_read_schema,
                                       arrow::ImportSchema(read_schema));
     read_schema_ = std::move(imported_read_schema);
@@ -479,7 +409,17 @@ Result<uint64_t> VortexFileBatchReader::GetPreviousBatchFileRowId(uint64_t batch
         return Status::Invalid(fmt::format("batch row id {} is out of range {}", batch_row_id,
                                            previous_batch_row_count_));
     }
-    return previous_first_row_ + batch_row_id;
+    const uint64_t emitted_offset = previous_first_row_ + batch_row_id;
+    // With a pushed-down selection Vortex returns only the selected rows in ascending index order,
+    // so map the emitted offset back to the original physical row id (mirrors Java's fromArray).
+    if (has_selection_) {
+        if (emitted_offset >= selection_row_ids_.size()) {
+            return Status::Invalid(fmt::format("emitted row offset {} exceeds selection size {}",
+                                               emitted_offset, selection_row_ids_.size()));
+        }
+        return selection_row_ids_[emitted_offset];
+    }
+    return emitted_offset;
 }
 
 Result<uint64_t> VortexFileBatchReader::GetNumberOfRows() const {
@@ -498,6 +438,7 @@ void VortexFileBatchReader::ReleaseStream() {
     if (stream_active_) {
         ArrowArrayStreamRelease(&current_stream_);
         current_stream_ = ::ArrowArrayStream{};
+        current_stream_schema_.reset();
         stream_active_ = false;
     }
 }

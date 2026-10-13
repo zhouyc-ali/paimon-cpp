@@ -46,6 +46,8 @@
 //! `#[repr(C)]` struct, a callback `type`, or a `#[no_mangle]` entry point here MUST be mirrored in
 //! that header in the same change.
 
+use std::ffi::CStr;
+use std::ffi::c_char;
 use std::ffi::c_void;
 use std::io;
 use std::sync::Arc;
@@ -62,10 +64,14 @@ use vortex::array::stream::ArrayStreamAdapter;
 use vortex::buffer::Alignment;
 use vortex::buffer::ByteBufferMut;
 use vortex::dtype::DType;
+use vortex::dtype::Nullability;
 use vortex::error::VortexResult;
 use vortex::error::vortex_bail;
 use vortex::error::vortex_ensure;
 use vortex::error::vortex_err;
+use vortex::extension::datetime::Date;
+use vortex::extension::datetime::TimeUnit;
+use vortex::extension::datetime::Timestamp;
 use vortex::file::OpenOptionsSessionExt;
 use vortex::file::WriteOptionsSessionExt;
 use vortex::file::WriteStrategyBuilder;
@@ -78,6 +84,9 @@ use vortex::io::runtime::BlockingRuntime;
 use vortex::io::runtime::Handle;
 use vortex::io::runtime::Task;
 use vortex::io::session::RuntimeSessionExt;
+use vortex::scalar::PValue;
+use vortex::scalar::Scalar;
+use vortex::scalar::ScalarValue;
 
 use crate::RUNTIME;
 use crate::array::vx_array;
@@ -86,6 +95,7 @@ use crate::dtype::vx_dtype;
 use crate::error::try_or;
 use crate::error::try_or_default;
 use crate::error::vx_error;
+use crate::scalar::vx_scalar;
 use crate::session::vx_session;
 
 /// Fill `length` bytes starting at `offset` into `dst`.
@@ -523,6 +533,128 @@ pub unsafe extern "C-unwind" fn vx_callback_sink_abort(sink: *mut vx_callback_si
     drop(unsafe { Box::from_raw(sink) });
 }
 
+/// Recursively rewrite Arrow view types (`Utf8View`/`BinaryView`) to their standard counterparts
+/// (`Utf8`/`Binary`), leaving every other type unchanged. paimon's C++ data model binds a schema's
+/// declared type to its buffer layout, so exporting standard types here lets Vortex run the
+/// view->standard conversion internally (a single pre-sized batch cast) instead of a per-row
+/// rebuild in the C++ reader.
+/// paimon-cpp self-maintained; used by the patched `vx_partition_scan_arrow`/`vx_dtype_to_arrow_schema`.
+pub(crate) fn normalize_arrow_schema_views(schema: arrow_schema::Schema) -> arrow_schema::Schema {
+    let fields = schema
+        .fields()
+        .iter()
+        .cloned()
+        .map(normalize_field_views)
+        .collect::<arrow_schema::Fields>();
+    arrow_schema::Schema::new_with_metadata(fields, schema.metadata.clone())
+}
+
+fn normalize_field_views(field: arrow_schema::FieldRef) -> arrow_schema::FieldRef {
+    Arc::new(
+        field
+            .as_ref()
+            .clone()
+            .with_data_type(normalize_dtype_views(field.data_type())),
+    )
+}
+
+fn normalize_dtype_views(dtype: &arrow_schema::DataType) -> arrow_schema::DataType {
+    use arrow_schema::DataType;
+    match dtype {
+        DataType::Utf8View => DataType::Utf8,
+        DataType::BinaryView => DataType::Binary,
+        DataType::Struct(fields) => {
+            DataType::Struct(fields.iter().cloned().map(normalize_field_views).collect())
+        }
+        DataType::List(field) => DataType::List(normalize_field_views(field.clone())),
+        DataType::LargeList(field) => DataType::LargeList(normalize_field_views(field.clone())),
+        DataType::FixedSizeList(field, size) => {
+            DataType::FixedSizeList(normalize_field_views(field.clone()), *size)
+        }
+        other => other.clone(),
+    }
+}
+
+/// Time unit of a timestamp scalar literal. Mirrored in `vortex_ffi.h`; the discriminants are an
+/// ABI contract, so do not reorder or renumber them.
+#[repr(C)]
+#[allow(non_camel_case_types, dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum vx_time_unit {
+    /// Seconds since the Unix epoch.
+    VX_TIME_UNIT_SECOND = 0,
+    /// Milliseconds since the Unix epoch.
+    VX_TIME_UNIT_MILLISECOND = 1,
+    /// Microseconds since the Unix epoch.
+    VX_TIME_UNIT_MICROSECOND = 2,
+    /// Nanoseconds since the Unix epoch.
+    VX_TIME_UNIT_NANOSECOND = 3,
+}
+
+/// Create a timestamp scalar literal: `value` units since the Unix epoch under `unit`.
+///
+/// `timezone` is a null-terminated UTF-8 IANA time-zone name, or null for a local (wall-clock)
+/// timestamp. Vortex's own C ABI has no timestamp/date scalar constructor, so paimon-cpp adds these
+/// two here to push down temporal predicates.
+///
+/// # Safety
+///
+/// `timezone`, when not null, must point to a valid null-terminated UTF-8 string that outlives this
+/// call. `err` must be null or point to a null `*mut vx_error`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn vx_scalar_new_timestamp(
+    value: i64,
+    unit: vx_time_unit,
+    timezone: *const c_char,
+    is_nullable: bool,
+    err: *mut *mut vx_error,
+) -> *mut vx_scalar {
+    try_or(err, std::ptr::null_mut(), || {
+        let time_unit = match unit {
+            vx_time_unit::VX_TIME_UNIT_SECOND => TimeUnit::Seconds,
+            vx_time_unit::VX_TIME_UNIT_MILLISECOND => TimeUnit::Milliseconds,
+            vx_time_unit::VX_TIME_UNIT_MICROSECOND => TimeUnit::Microseconds,
+            vx_time_unit::VX_TIME_UNIT_NANOSECOND => TimeUnit::Nanoseconds,
+        };
+        let tz = if timezone.is_null() {
+            None
+        } else {
+            let name = unsafe { CStr::from_ptr(timezone) }
+                .to_str()
+                .map_err(|e| vortex_err!("timezone is not valid utf8: {e}"))?;
+            Some(Arc::from(name))
+        };
+        let dtype = DType::Extension(
+            Timestamp::new_with_tz(time_unit, tz, Nullability::from(is_nullable)).erased(),
+        );
+        Ok(vx_scalar::new(Scalar::try_new(
+            dtype,
+            Some(ScalarValue::Primitive(PValue::I64(value))),
+        )?))
+    })
+}
+
+/// Create a date scalar literal: `days` days since the Unix epoch (1970-01-01).
+///
+/// # Safety
+///
+/// `err` must be null or point to a null `*mut vx_error`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn vx_scalar_new_date(
+    days: i32,
+    is_nullable: bool,
+    err: *mut *mut vx_error,
+) -> *mut vx_scalar {
+    try_or(err, std::ptr::null_mut(), || {
+        let dtype =
+            DType::Extension(Date::new(TimeUnit::Days, Nullability::from(is_nullable)).erased());
+        Ok(vx_scalar::new(Scalar::try_new(
+            dtype,
+            Some(ScalarValue::Primitive(PValue::I32(days))),
+        )?))
+    })
+}
+
 #[cfg(test)]
 #[cfg(unix)]
 mod tests {
@@ -556,6 +688,127 @@ mod tests {
     use crate::sink::vx_array_sink_close;
     use crate::sink::vx_array_sink_open_file;
     use crate::sink::vx_array_sink_push;
+
+    #[test]
+    fn scalar_new_timestamp_and_date_build_extension_scalars() {
+        use crate::scalar::vx_scalar_free;
+
+        unsafe {
+            // Local (no timezone) millisecond timestamp -> Timestamp extension dtype.
+            let mut error = ptr::null_mut();
+            let ts = vx_scalar_new_timestamp(
+                1_700_000_000_123,
+                vx_time_unit::VX_TIME_UNIT_MILLISECOND,
+                ptr::null(),
+                false,
+                &raw mut error,
+            );
+            assert!(error.is_null());
+            assert!(!ts.is_null());
+            let DType::Extension(ext) = vx_scalar::as_ref(ts).dtype() else {
+                panic!("timestamp scalar must carry an extension dtype");
+            };
+            assert!(ext.is::<Timestamp>());
+            vx_scalar_free(ts);
+
+            // A zoned, nullable timestamp is accepted (Vortex validates the zone name).
+            let tz = std::ffi::CString::new("America/New_York").unwrap();
+            let ts_tz = vx_scalar_new_timestamp(
+                0,
+                vx_time_unit::VX_TIME_UNIT_SECOND,
+                tz.as_ptr(),
+                true,
+                &raw mut error,
+            );
+            assert!(error.is_null());
+            assert!(!ts_tz.is_null());
+            vx_scalar_free(ts_tz);
+
+            // Date scalar -> Date extension dtype.
+            let date = vx_scalar_new_date(19_000, false, &raw mut error);
+            assert!(error.is_null());
+            assert!(!date.is_null());
+            let DType::Extension(ext) = vx_scalar::as_ref(date).dtype() else {
+                panic!("date scalar must carry an extension dtype");
+            };
+            assert!(ext.is::<Date>());
+            vx_scalar_free(date);
+        }
+    }
+
+    #[test]
+    fn normalize_arrow_schema_views_rewrites_view_types_recursively() {
+        use arrow_schema::DataType;
+        use arrow_schema::Field;
+        use arrow_schema::Schema;
+        use std::sync::Arc;
+
+        let schema = Schema::new(vec![
+            Field::new("plain_utf8", DataType::Utf8, false),
+            Field::new("utf8_view", DataType::Utf8View, true),
+            Field::new("binary_view", DataType::BinaryView, true),
+            Field::new(
+                "struct_col",
+                DataType::Struct(
+                    vec![
+                        Field::new("inner_view", DataType::Utf8View, true),
+                        Field::new("inner_int", DataType::Int32, false),
+                    ]
+                    .into(),
+                ),
+                true,
+            ),
+            Field::new(
+                "list_view",
+                DataType::List(Arc::new(Field::new("item", DataType::Utf8View, true))),
+                true,
+            ),
+            Field::new(
+                "fsl_view",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::BinaryView, true)), 3),
+                true,
+            ),
+        ]);
+
+        let normalized = normalize_arrow_schema_views(schema);
+
+        // View leaf types become standard; non-view leaves are untouched.
+        assert_eq!(
+            normalized.field_with_name("plain_utf8").unwrap().data_type(),
+            &DataType::Utf8
+        );
+        assert_eq!(
+            normalized.field_with_name("utf8_view").unwrap().data_type(),
+            &DataType::Utf8
+        );
+        assert_eq!(
+            normalized.field_with_name("binary_view").unwrap().data_type(),
+            &DataType::Binary
+        );
+        // Recursion reaches view leaves nested in struct / list / fixed_size_list.
+        match normalized.field_with_name("struct_col").unwrap().data_type() {
+            DataType::Struct(fields) => {
+                assert_eq!(fields[0].data_type(), &DataType::Utf8);
+                assert_eq!(fields[1].data_type(), &DataType::Int32);
+            }
+            other => panic!("expected Struct, got {:?}", other),
+        }
+        match normalized.field_with_name("list_view").unwrap().data_type() {
+            DataType::List(field) => assert_eq!(field.data_type(), &DataType::Utf8),
+            other => panic!("expected List, got {:?}", other),
+        }
+        match normalized.field_with_name("fsl_view").unwrap().data_type() {
+            DataType::FixedSizeList(field, size) => {
+                assert_eq!(field.data_type(), &DataType::Binary);
+                assert_eq!(*size, 3);
+            }
+            other => panic!("expected FixedSizeList, got {:?}", other),
+        }
+        // Only data types change: field count, names, and nullability are preserved.
+        assert_eq!(normalized.fields().len(), 6);
+        assert!(normalized.field_with_name("utf8_view").unwrap().is_nullable());
+        assert!(!normalized.field_with_name("plain_utf8").unwrap().is_nullable());
+    }
 
     /// Host context standing in for paimon's `InputStream`: positional reads against a file.
     struct FileContext {
