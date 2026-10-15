@@ -123,8 +123,17 @@ class VortexFileBatchReader : public FileBatchReader {
     bool has_selection_ = false;
     std::vector<uint64_t> selection_row_ids_;
 
+    // Predicate pushed into the scan as a native filter. Filtering drops non-matching rows, so the
+    // scan also returns a hidden `_row_idx` column (include_row_idx) with each surviving row's
+    // original physical position; previous_batch_row_idx_ holds that column for the last batch and
+    // GetPreviousBatchFileRowId reads it, since the rows_emitted_ accumulator is wrong once rows
+    // are dropped.
+    bool has_filter_ = false;
+    std::shared_ptr<arrow::Array> previous_batch_row_idx_;
+
     std::shared_ptr<arrow::MemoryPool> arrow_pool_;
-    std::shared_ptr<PredicateFilter> predicate_filter_;  // from SetReadSchema; not pushed down
+    std::shared_ptr<PredicateFilter>
+        predicate_filter_;  // from SetReadSchema; pushed down if convertible
     std::shared_ptr<Metrics> metrics_;
     bool closed_ = false;
 };

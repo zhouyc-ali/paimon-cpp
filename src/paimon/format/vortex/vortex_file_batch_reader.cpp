@@ -38,12 +38,17 @@
 #include "paimon/common/utils/math.h"
 #include "paimon/core/utils/nested_projection_utils.h"
 #include "paimon/format/vortex/vortex_ffi_util.h"
+#include "paimon/format/vortex/vortex_predicate_converter.h"
 #include "paimon/fs/file_system.h"
 #include "paimon/utils/roaring_bitmap32.h"
 
 namespace paimon::vortex {
 
 namespace {
+
+// The hidden column the scan appends when include_row_idx is set; must match the name in the
+// patched vortex-ffi scan.rs. It carries each returned row's original physical index.
+constexpr char kRowIdxColumn[] = "_row_idx";
 
 // Vortex reports the file's zone and paimon asks for the reader's; the instants are the same.
 std::shared_ptr<arrow::ArrayData> AlignTimestampTimezones(
@@ -229,6 +234,16 @@ Result<bool> VortexFileBatchReader::OpenNextPartitionStream() {
             options.selection.idx_len = selection_row_ids_.size();
             options.selection.include = VX_SELECTION_INCLUDE_RANGE;
         }
+        // Push the predicate as a native filter when convertible; Vortex prunes by zone-map and
+        // drops non-matching rows. include_row_idx makes the scan append a hidden `_row_idx` column
+        // so GetPreviousBatchFileRowId can still report original physical positions after rows are
+        // dropped. The scan clones the filter, so it is freed when this block exits.
+        VxExpressionPtr filter = VortexPredicateConverter::Convert(predicate_filter_, file_schema_);
+        if (filter != nullptr) {
+            options.filter = filter.get();
+            options.include_row_idx = true;
+            has_filter_ = true;
+        }
         VxScanPtr scan(
             vx_data_source_scan(data_source_.get(), &options, /*estimate=*/nullptr, &error),
             vx_scan_free);
@@ -340,6 +355,18 @@ Result<BatchReader::ReadBatch> VortexFileBatchReader::NextBatch() {
         current_batch_->Slice(current_batch_offset_, row_count);
     PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<arrow::Array> normalized_array,
                            ArrowUtils::NormalizeArrayOffsets(sliced_array, arrow_pool_.get()));
+    if (has_filter_) {
+        // The scan appended a hidden `_row_idx` column (last field) with each surviving row's
+        // original physical position; capture it before AlignToReadSchema drops it (read_schema_
+        // has no _row_idx field).
+        const auto& struct_type = checked_cast<const arrow::StructType&>(*normalized_array->type());
+        const int row_idx_pos = struct_type.num_fields() - 1;
+        if (row_idx_pos < 0 || struct_type.field(row_idx_pos)->name() != kRowIdxColumn) {
+            return Status::Invalid("Vortex scan did not append the _row_idx column");
+        }
+        previous_batch_row_idx_ =
+            checked_cast<const arrow::StructArray&>(*normalized_array).field(row_idx_pos);
+    }
     PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<arrow::Array> projected_array,
                            AlignToReadSchema(normalized_array));
 
@@ -396,6 +423,8 @@ Status VortexFileBatchReader::SetReadSchema(
     rows_emitted_ = 0;
     previous_first_row_ = std::numeric_limits<uint64_t>::max();
     previous_batch_row_count_ = 0;
+    has_filter_ = false;
+    previous_batch_row_idx_.reset();
     return Status::OK();
 }
 
@@ -408,6 +437,18 @@ Result<uint64_t> VortexFileBatchReader::GetPreviousBatchFileRowId(uint64_t batch
     if (batch_row_id >= previous_batch_row_count_) {
         return Status::Invalid(fmt::format("batch row id {} is out of range {}", batch_row_id,
                                            previous_batch_row_count_));
+    }
+    // Filter pushdown drops non-matching rows, so positions are non-contiguous; report the original
+    // physical index Vortex returned in the hidden _row_idx column (it also accounts for any
+    // selection applied together with the filter).
+    if (has_filter_) {
+        if (previous_batch_row_idx_ == nullptr ||
+            batch_row_id >= static_cast<uint64_t>(previous_batch_row_idx_->length())) {
+            return Status::Invalid(
+                fmt::format("Vortex filter row index unavailable for row {}", batch_row_id));
+        }
+        return checked_cast<const arrow::UInt64Array&>(*previous_batch_row_idx_)
+            .Value(static_cast<int64_t>(batch_row_id));
     }
     const uint64_t emitted_offset = previous_first_row_ + batch_row_id;
     // With a pushed-down selection Vortex returns only the selected rows in ascending index order,

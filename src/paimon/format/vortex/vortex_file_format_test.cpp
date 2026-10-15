@@ -42,6 +42,8 @@
 #include "paimon/common/utils/checked_cast.h"
 #include "paimon/common/utils/path_util.h"
 #include "paimon/common/utils/scope_guard.h"
+#include "paimon/data/timestamp.h"
+#include "paimon/defs.h"
 #include "paimon/format/column_stats.h"
 #include "paimon/format/file_format.h"
 #include "paimon/format/file_format_factory.h"
@@ -53,6 +55,8 @@
 #include "paimon/fs/file_system.h"
 #include "paimon/fs/local/local_file_system.h"
 #include "paimon/memory/memory_pool.h"
+#include "paimon/predicate/literal.h"
+#include "paimon/predicate/predicate_builder.h"
 #include "paimon/reader/batch_reader.h"
 #include "paimon/reader/file_batch_reader.h"
 #include "paimon/testing/utils/io_exception_helper.h"
@@ -921,6 +925,168 @@ TEST_F(VortexFileFormatTest, SelectionPushdownReturnsSelectedRowsAndPhysicalRowI
     }
     ASSERT_EQ(got_ids, (std::vector<int32_t>{10, 30, 50, 70}));
     ASSERT_EQ(got_row_ids, (std::vector<uint64_t>{1, 3, 5, 7}));
+}
+
+TEST_F(VortexFileFormatTest, FilterPushdownReturnsMatchingRowsAndPhysicalRowIds) {
+    const int64_t kRows = 10;
+    arrow::Int32Builder id_b;
+    arrow::StringBuilder name_b;
+    for (int64_t i = 0; i < kRows; ++i) {
+        ASSERT_TRUE(id_b.Append(static_cast<int32_t>(i * 10)).ok());
+        ASSERT_TRUE(name_b.Append("row_" + std::to_string(i)).ok());
+    }
+    std::shared_ptr<arrow::Array> id_arr;
+    std::shared_ptr<arrow::Array> name_arr;
+    ASSERT_TRUE(id_b.Finish(&id_arr).ok());
+    ASSERT_TRUE(name_b.Finish(&name_arr).ok());
+    arrow::FieldVector fields = {arrow::field("id", arrow::int32(), false),
+                                 arrow::field("name", arrow::utf8())};
+    std::shared_ptr<arrow::Schema> schema = arrow::schema(fields);
+    std::shared_ptr<arrow::Array> data =
+        arrow::StructArray::Make({id_arr, name_arr}, fields).ValueOrDie();
+
+    std::string path = PathUtil::JoinPath(directory_->Str(), "filter.vortex");
+    ASSERT_OK(WriteFile(path, schema, data, /*batch_size=*/4));
+
+    // Push down `id > 30`: rows 4..9 (ids 40..90) survive and rows 0..3 are dropped by the scan.
+    std::shared_ptr<Predicate> predicate = PredicateBuilder::GreaterThan(
+        /*field_index=*/0, "id", FieldType::INT, Literal(static_cast<int32_t>(30)));
+
+    // batch_size=2 spreads the 6 surviving rows over three batches, exercising cross-batch row ids.
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<ReaderBuilder> reader_builder,
+                         format_->CreateReaderBuilder(/*batch_size=*/2));
+    reader_builder->WithMemoryPool(pool_);
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<InputStream> input, file_system_->Open(path));
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<FileBatchReader> reader, reader_builder->Build(input));
+    ::ArrowSchema ffi_schema = {};
+    ASSERT_TRUE(arrow::ExportSchema(*schema, &ffi_schema).ok());
+    ASSERT_OK(reader->SetReadSchema(&ffi_schema, predicate, /*selection_bitmap=*/std::nullopt));
+
+    std::vector<int32_t> got_ids;
+    std::vector<uint64_t> got_row_ids;
+    while (true) {
+        ASSERT_OK_AND_ASSIGN(BatchReader::ReadBatch batch, reader->NextBatch());
+        if (BatchReader::IsEofBatch(batch)) {
+            break;
+        }
+        std::shared_ptr<arrow::Array> arr =
+            arrow::ImportArray(batch.first.get(), batch.second.get()).ValueOrDie();
+        std::shared_ptr<arrow::Int32Array> id_col = std::static_pointer_cast<arrow::Int32Array>(
+            std::static_pointer_cast<arrow::StructArray>(arr)->GetFieldByName("id"));
+        for (int64_t i = 0; i < arr->length(); ++i) {
+            got_ids.push_back(id_col->Value(i));
+            ASSERT_OK_AND_ASSIGN(uint64_t row_id,
+                                 reader->GetPreviousBatchFileRowId(static_cast<uint64_t>(i)));
+            got_row_ids.push_back(row_id);
+        }
+    }
+    // Only matching rows come back, and _row_idx reports their original physical positions rather
+    // than a re-numbering (which is what the rows_emitted_ accumulator would wrongly produce).
+    ASSERT_EQ(got_ids, (std::vector<int32_t>{40, 50, 60, 70, 80, 90}));
+    ASSERT_EQ(got_row_ids, (std::vector<uint64_t>{4, 5, 6, 7, 8, 9}));
+}
+
+TEST_F(VortexFileFormatTest, FilterPushdownOnDateColumn) {
+    const int64_t kRows = 10;
+    arrow::Date32Builder d_b;
+    for (int64_t i = 0; i < kRows; ++i) {
+        ASSERT_TRUE(d_b.Append(static_cast<int32_t>(18000 + i)).ok());
+    }
+    std::shared_ptr<arrow::Array> d_arr;
+    ASSERT_TRUE(d_b.Finish(&d_arr).ok());
+    arrow::FieldVector fields = {arrow::field("d", arrow::date32(), false)};
+    std::shared_ptr<arrow::Schema> schema = arrow::schema(fields);
+    std::shared_ptr<arrow::Array> data = arrow::StructArray::Make({d_arr}, fields).ValueOrDie();
+
+    std::string path = PathUtil::JoinPath(directory_->Str(), "filter_date.vortex");
+    ASSERT_OK(WriteFile(path, schema, data, /*batch_size=*/4));
+
+    // paimon-java pushes a DATE literal as its int32 days-since-epoch; `d > 18005` keeps rows 6..9.
+    std::shared_ptr<Predicate> predicate = PredicateBuilder::GreaterThan(
+        /*field_index=*/0, "d", FieldType::DATE, Literal(FieldType::DATE, 18005));
+
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<ReaderBuilder> reader_builder,
+                         format_->CreateReaderBuilder(/*batch_size=*/3));
+    reader_builder->WithMemoryPool(pool_);
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<InputStream> input, file_system_->Open(path));
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<FileBatchReader> reader, reader_builder->Build(input));
+    ::ArrowSchema ffi_schema = {};
+    ASSERT_TRUE(arrow::ExportSchema(*schema, &ffi_schema).ok());
+    ASSERT_OK(reader->SetReadSchema(&ffi_schema, predicate, /*selection_bitmap=*/std::nullopt));
+
+    std::vector<int32_t> got_days;
+    std::vector<uint64_t> got_row_ids;
+    while (true) {
+        ASSERT_OK_AND_ASSIGN(BatchReader::ReadBatch batch, reader->NextBatch());
+        if (BatchReader::IsEofBatch(batch)) {
+            break;
+        }
+        std::shared_ptr<arrow::Array> arr =
+            arrow::ImportArray(batch.first.get(), batch.second.get()).ValueOrDie();
+        std::shared_ptr<arrow::Date32Array> d_col = std::static_pointer_cast<arrow::Date32Array>(
+            std::static_pointer_cast<arrow::StructArray>(arr)->GetFieldByName("d"));
+        for (int64_t i = 0; i < arr->length(); ++i) {
+            got_days.push_back(d_col->Value(i));
+            ASSERT_OK_AND_ASSIGN(uint64_t row_id,
+                                 reader->GetPreviousBatchFileRowId(static_cast<uint64_t>(i)));
+            got_row_ids.push_back(row_id);
+        }
+    }
+    ASSERT_EQ(got_days, (std::vector<int32_t>{18006, 18007, 18008, 18009}));
+    ASSERT_EQ(got_row_ids, (std::vector<uint64_t>{6, 7, 8, 9}));
+}
+
+TEST_F(VortexFileFormatTest, FilterPushdownOnTimestampColumn) {
+    const int64_t kRows = 10;
+    arrow::TimestampBuilder ts_b(arrow::timestamp(arrow::TimeUnit::MILLI),
+                                 arrow::default_memory_pool());
+    for (int64_t i = 0; i < kRows; ++i) {
+        ASSERT_TRUE(ts_b.Append(i * 1000).ok());
+    }
+    std::shared_ptr<arrow::Array> ts_arr;
+    ASSERT_TRUE(ts_b.Finish(&ts_arr).ok());
+    arrow::FieldVector fields = {arrow::field("ts", arrow::timestamp(arrow::TimeUnit::MILLI))};
+    std::shared_ptr<arrow::Schema> schema = arrow::schema(fields);
+    std::shared_ptr<arrow::Array> data = arrow::StructArray::Make({ts_arr}, fields).ValueOrDie();
+
+    std::string path = PathUtil::JoinPath(directory_->Str(), "filter_ts.vortex");
+    ASSERT_OK(WriteFile(path, schema, data, /*batch_size=*/4));
+
+    // The timestamp literal takes its unit from the stored column (millis here); `ts > 5000ms`
+    // keeps rows 6..9.
+    std::shared_ptr<Predicate> predicate = PredicateBuilder::GreaterThan(
+        /*field_index=*/0, "ts", FieldType::TIMESTAMP, Literal(Timestamp::FromEpochMillis(5000)));
+
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<ReaderBuilder> reader_builder,
+                         format_->CreateReaderBuilder(/*batch_size=*/3));
+    reader_builder->WithMemoryPool(pool_);
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<InputStream> input, file_system_->Open(path));
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<FileBatchReader> reader, reader_builder->Build(input));
+    ::ArrowSchema ffi_schema = {};
+    ASSERT_TRUE(arrow::ExportSchema(*schema, &ffi_schema).ok());
+    ASSERT_OK(reader->SetReadSchema(&ffi_schema, predicate, /*selection_bitmap=*/std::nullopt));
+
+    std::vector<int64_t> got_ts;
+    std::vector<uint64_t> got_row_ids;
+    while (true) {
+        ASSERT_OK_AND_ASSIGN(BatchReader::ReadBatch batch, reader->NextBatch());
+        if (BatchReader::IsEofBatch(batch)) {
+            break;
+        }
+        std::shared_ptr<arrow::Array> arr =
+            arrow::ImportArray(batch.first.get(), batch.second.get()).ValueOrDie();
+        std::shared_ptr<arrow::TimestampArray> ts_col =
+            std::static_pointer_cast<arrow::TimestampArray>(
+                std::static_pointer_cast<arrow::StructArray>(arr)->GetFieldByName("ts"));
+        for (int64_t i = 0; i < arr->length(); ++i) {
+            got_ts.push_back(ts_col->Value(i));
+            ASSERT_OK_AND_ASSIGN(uint64_t row_id,
+                                 reader->GetPreviousBatchFileRowId(static_cast<uint64_t>(i)));
+            got_row_ids.push_back(row_id);
+        }
+    }
+    ASSERT_EQ(got_ts, (std::vector<int64_t>{6000, 7000, 8000, 9000}));
+    ASSERT_EQ(got_row_ids, (std::vector<uint64_t>{6, 7, 8, 9}));
 }
 
 }  // namespace paimon::vortex::test
